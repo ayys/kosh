@@ -283,9 +283,328 @@ pub mod utils {
     }
 }
 
+/// DICT Protocol Server Implementation
+pub mod dict_server {
+    use crate::NepaliDictionary;
+    use std::sync::Arc;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::RwLock;
+
+    /// DICT protocol response codes
+    pub mod response_codes {
+        pub const BANNER: &str = "220";
+        pub const CLOSING_CONNECTION: &str = "221";
+        pub const OK: &str = "250";
+        pub const DATABASES_FOLLOW: &str = "110";
+        pub const STRATEGIES_FOLLOW: &str = "111";
+        pub const HELP_FOLLOWS: &str = "113";
+        pub const DEFINITIONS_RETRIEVED: &str = "150";
+        pub const DEFINITION_FOLLOWS: &str = "151";
+        pub const MATCHES_FOLLOW: &str = "152";
+        pub const STATUS_INFO: &str = "210";
+        pub const SYNTAX_ERROR: &str = "500";
+        pub const ILLEGAL_PARAMS: &str = "501";
+        pub const COMMAND_NOT_IMPLEMENTED: &str = "502";
+        pub const NO_MATCH: &str = "552";
+        pub const NO_DATABASES: &str = "554";
+    }
+
+    /// Represents a DICT server instance
+    pub struct DictServer {
+        dictionary: Arc<RwLock<NepaliDictionary>>,
+        server_info: ServerInfo,
+    }
+
+    /// Server information for identification
+    #[derive(Debug, Clone)]
+    pub struct ServerInfo {
+        pub name: String,
+        pub version: String,
+        pub description: String,
+    }
+
+    impl Default for ServerInfo {
+        fn default() -> Self {
+            Self {
+                name: "kosh".to_string(),
+                version: "0.1.0".to_string(),
+                description: "Kosh - an extendable DICT server written in Rust".to_string(),
+            }
+        }
+    }
+
+    impl DictServer {
+        /// Create a new DICT server with the given dictionary
+        pub fn new(dictionary: NepaliDictionary) -> Self {
+            Self {
+                dictionary: Arc::new(RwLock::new(dictionary)),
+                server_info: ServerInfo::default(),
+            }
+        }
+
+        /// Create a new DICT server with custom server info
+        pub fn with_info(dictionary: NepaliDictionary, server_info: ServerInfo) -> Self {
+            Self {
+                dictionary: Arc::new(RwLock::new(dictionary)),
+                server_info,
+            }
+        }
+
+        /// Start the DICT server on the specified address
+        pub async fn start(&self, addr: &str) -> tokio::io::Result<()> {
+            let listener = TcpListener::bind(addr).await?;
+            println!("DICT server listening on {}", addr);
+
+            loop {
+                let (stream, peer_addr) = listener.accept().await?;
+                println!("New connection from: {}", peer_addr);
+
+                let dictionary = Arc::clone(&self.dictionary);
+                let server_info = self.server_info.clone();
+
+                tokio::spawn(async move {
+                    if let Err(e) = Self::handle_client(stream, dictionary, server_info).await {
+                        eprintln!("Error handling client {}: {}", peer_addr, e);
+                    }
+                });
+            }
+        }
+
+        /// Handle a single client connection
+        async fn handle_client(
+            mut stream: TcpStream,
+            dictionary: Arc<RwLock<NepaliDictionary>>,
+            server_info: ServerInfo,
+        ) -> tokio::io::Result<()> {
+            // Send initial banner
+            let banner = format!(
+                "{} {} {} <kosh.{}.{}>\r\n",
+                response_codes::BANNER,
+                server_info.name,
+                server_info.description,
+                server_info.version,
+                chrono::Utc::now().timestamp()
+            );
+            stream.write_all(banner.as_bytes()).await?;
+
+            // Split the stream for reading and writing
+            let (reader, mut writer) = stream.into_split();
+            let reader = BufReader::new(reader);
+            let mut lines = reader.lines();
+
+            while let Some(line) = lines.next_line().await? {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+
+                let response = Self::process_command(&line, &dictionary, &server_info).await;
+                writer.write_all(response.as_bytes()).await?;
+
+                // Check if client sent QUIT
+                if line.to_uppercase().starts_with("QUIT") {
+                    break;
+                }
+            }
+
+            Ok(())
+        }
+
+        /// Process a DICT command and return the appropriate response
+        pub async fn process_command(
+            command: &str,
+            dictionary: &Arc<RwLock<NepaliDictionary>>,
+            server_info: &ServerInfo,
+        ) -> String {
+            let parts: Vec<&str> = command.split_whitespace().collect();
+            if parts.is_empty() {
+                return format!("{} Syntax error, command not recognized\r\n", response_codes::SYNTAX_ERROR);
+            }
+
+            let cmd = parts[0].to_uppercase();
+
+            match cmd.as_str() {
+                "HELP" => Self::handle_help().await,
+                "QUIT" => Self::handle_quit().await,
+                "DEFINE" => Self::handle_define(&parts[1..], dictionary).await,
+                "SHOW" => Self::handle_show(&parts[1..], dictionary, server_info).await,
+                "STATUS" => Self::handle_status(server_info).await,
+                "CLIENT" => Self::handle_client_info(&parts[1..]).await,
+                "MATCH" => Self::handle_match(&parts[1..], dictionary).await,
+                _ => format!("{} Syntax error, command not recognized\r\n", response_codes::SYNTAX_ERROR),
+            }
+        }
+
+        /// Handle HELP command
+        async fn handle_help() -> String {
+            let mut response = format!("{} Help text follows\r\n", response_codes::HELP_FOLLOWS);
+            response.push_str("DEFINE database word            look up word in database\r\n");
+            response.push_str("MATCH database strategy word    match word in database using strategy\r\n");
+            response.push_str("SHOW DB                         list available databases\r\n");
+            response.push_str("SHOW STRAT                      list available strategies\r\n");
+            response.push_str("SHOW INFO                       provide information about the server\r\n");
+            response.push_str("SHOW SERVER                     provide site-specific information\r\n");
+            response.push_str("CLIENT info                     provide information about client\r\n");
+            response.push_str("STATUS                          display server status\r\n");
+            response.push_str("HELP                            display this help\r\n");
+            response.push_str("QUIT                            close connection\r\n");
+            response.push_str(".\r\n");
+            response.push_str(&format!("{} Command complete\r\n", response_codes::OK));
+            response
+        }
+
+        /// Handle QUIT command
+        async fn handle_quit() -> String {
+            format!("{} Closing Connection\r\n", response_codes::CLOSING_CONNECTION)
+        }
+
+        /// Handle STATUS command
+        async fn handle_status(server_info: &ServerInfo) -> String {
+            format!(
+                "{} {} {} uptime: {}s\r\n",
+                response_codes::STATUS_INFO,
+                server_info.name,
+                server_info.version,
+                chrono::Utc::now().timestamp() % 3600 // Simple uptime simulation
+            )
+        }
+
+        /// Handle CLIENT command
+        async fn handle_client_info(_args: &[&str]) -> String {
+            format!("{} ok\r\n", response_codes::OK)
+        }
+
+        /// Handle DEFINE command
+        async fn handle_define(args: &[&str], dictionary: &Arc<RwLock<NepaliDictionary>>) -> String {
+            if args.len() < 2 {
+                return format!("{} Syntax error, illegal parameters\r\n", response_codes::ILLEGAL_PARAMS);
+            }
+
+            let _database = args[0];
+            let word = args[1];
+
+            // For now, ignore database selection and search in our dictionary
+            let dict = dictionary.read().await;
+            
+            if let Some(entry) = dict.find_word(word) {
+                let mut response = format!("{} 1 definitions found: list follows\r\n", response_codes::DEFINITIONS_RETRIEVED);
+                response.push_str(&format!(
+                    "{} \"{}\" nepali \"Nepali Dictionary\" : definition follows\r\n",
+                    response_codes::DEFINITION_FOLLOWS,
+                    word
+                ));
+                
+                // Format definitions
+                for (i, def) in entry.definitions.iter().enumerate() {
+                    response.push_str(&format!("{}. {} ({})\r\n", i + 1, def.senses.join("; "), def.grammar.to_abbreviation()));
+                    if let Some(etymology) = &def.etymology {
+                        response.push_str(&format!("   Etymology: {}\r\n", etymology.to_bracket_notation()));
+                    }
+                }
+                
+                response.push_str(".\r\n");
+                response.push_str(&format!("{} Command complete\r\n", response_codes::OK));
+                response
+            } else {
+                format!("{} No match\r\n", response_codes::NO_MATCH)
+            }
+        }
+
+        /// Handle MATCH command (basic implementation)
+        async fn handle_match(args: &[&str], dictionary: &Arc<RwLock<NepaliDictionary>>) -> String {
+            if args.len() < 3 {
+                return format!("{} Syntax error, illegal parameters\r\n", response_codes::ILLEGAL_PARAMS);
+            }
+
+            let _database = args[0];
+            let strategy = args[1];
+            let word = args[2];
+
+            let dict = dictionary.read().await;
+            
+            let matches = match strategy {
+                "prefix" => dict.search_prefix(word),
+                "substring" => dict.search_contains(word),
+                "exact" => {
+                    if let Some(_) = dict.find_word(word) {
+                        vec![dict.find_word(word).unwrap()]
+                    } else {
+                        vec![]
+                    }
+                },
+                _ => vec![], // Unknown strategy
+            };
+
+            if matches.is_empty() {
+                format!("{} No match\r\n", response_codes::NO_MATCH)
+            } else {
+                let mut response = format!("{} {} matches found: list follows\r\n", response_codes::MATCHES_FOLLOW, matches.len());
+                for entry in matches {
+                    response.push_str(&format!("nepali \"{}\"\r\n", entry.word));
+                }
+                response.push_str(".\r\n");
+                response.push_str(&format!("{} Command complete\r\n", response_codes::OK));
+                response
+            }
+        }
+
+        /// Handle SHOW commands
+        async fn handle_show(
+            args: &[&str],
+            dictionary: &Arc<RwLock<NepaliDictionary>>,
+            server_info: &ServerInfo,
+        ) -> String {
+            if args.is_empty() {
+                return format!("{} Syntax error, illegal parameters\r\n", response_codes::ILLEGAL_PARAMS);
+            }
+
+            match args[0].to_uppercase().as_str() {
+                "DB" => {
+                    let dict = dictionary.read().await;
+                    let count = dict.len();
+                    let mut response = format!("{} 1 database present: list follows\r\n", response_codes::DATABASES_FOLLOW);
+                    response.push_str(&format!("nepali \"Nepali Dictionary ({} entries)\"\r\n", count));
+                    response.push_str(".\r\n");
+                    response.push_str(&format!("{} Command complete\r\n", response_codes::OK));
+                    response
+                }
+                "STRAT" => {
+                    let mut response = format!("{} 3 strategies available: list follows\r\n", response_codes::STRATEGIES_FOLLOW);
+                    response.push_str("exact \"Exact match\"\r\n");
+                    response.push_str("prefix \"Match prefixes\"\r\n");
+                    response.push_str("substring \"Match substrings\"\r\n");
+                    response.push_str(".\r\n");
+                    response.push_str(&format!("{} Command complete\r\n", response_codes::OK));
+                    response
+                }
+                "INFO" => {
+                    let mut response = format!("{} server information follows\r\n", response_codes::DATABASES_FOLLOW);
+                    response.push_str(&format!("Server: {}\r\n", server_info.description));
+                    response.push_str(&format!("Version: {}\r\n", server_info.version));
+                    response.push_str("Protocol: DICT 1.0 (RFC 2229)\r\n");
+                    response.push_str(".\r\n");
+                    response.push_str(&format!("{} Command complete\r\n", response_codes::OK));
+                    response
+                }
+                "SERVER" => {
+                    let mut response = format!("{} server information follows\r\n", response_codes::DATABASES_FOLLOW);
+                    response.push_str("This is a Kosh DICT server implementation\r\n");
+                    response.push_str("Built in Rust for serving Nepali dictionary data\r\n");
+                    response.push_str(".\r\n");
+                    response.push_str(&format!("{} Command complete\r\n", response_codes::OK));
+                    response
+                }
+                _ => format!("{} Syntax error, illegal parameters\r\n", response_codes::ILLEGAL_PARAMS),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dict_server::{DictServer, ServerInfo};
 
     #[test]
     fn test_grammar_category_parsing() {
@@ -321,5 +640,70 @@ mod tests {
         dict.add_entry(entry);
         assert_eq!(dict.len(), 1);
         assert!(dict.find_word("अ").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_dict_server_help_command() {
+        let dict = NepaliDictionary::new();
+        let server_info = ServerInfo::default();
+        
+        let response = DictServer::process_command("HELP", &std::sync::Arc::new(tokio::sync::RwLock::new(dict)), &server_info).await;
+        
+        assert!(response.contains("113 Help text follows"));
+        assert!(response.contains("DEFINE database word"));
+        assert!(response.contains("MATCH database strategy word"));
+        assert!(response.contains("250 Command complete"));
+    }
+
+    #[tokio::test]
+    async fn test_dict_server_quit_command() {
+        let dict = NepaliDictionary::new();
+        let server_info = ServerInfo::default();
+        
+        let response = DictServer::process_command("QUIT", &std::sync::Arc::new(tokio::sync::RwLock::new(dict)), &server_info).await;
+        
+        assert!(response.contains("221 Closing Connection"));
+    }
+
+    #[tokio::test]
+    async fn test_dict_server_define_command() {
+        let mut dict = NepaliDictionary::new();
+        let entry = DictionaryEntry {
+            word: "test".to_string(),
+            definitions: vec![Definition {
+                grammar: GrammarCategory::Noun,
+                etymology: None,
+                senses: vec!["a test word".to_string()],
+            }],
+        };
+        dict.add_entry(entry);
+        
+        let server_info = ServerInfo::default();
+        let response = DictServer::process_command("DEFINE nepali test", &std::sync::Arc::new(tokio::sync::RwLock::new(dict)), &server_info).await;
+        
+        assert!(response.contains("150 1 definitions found"));
+        assert!(response.contains("151 \"test\" nepali"));
+        assert!(response.contains("a test word"));
+    }
+
+    #[tokio::test]
+    async fn test_dict_server_show_db_command() {
+        let mut dict = NepaliDictionary::new();
+        let entry = DictionaryEntry {
+            word: "test".to_string(),
+            definitions: vec![Definition {
+                grammar: GrammarCategory::Noun,
+                etymology: None,
+                senses: vec!["a test word".to_string()],
+            }],
+        };
+        dict.add_entry(entry);
+        
+        let server_info = ServerInfo::default();
+        let response = DictServer::process_command("SHOW DB", &std::sync::Arc::new(tokio::sync::RwLock::new(dict)), &server_info).await;
+        
+        assert!(response.contains("110 1 database present"));
+        assert!(response.contains("nepali \"Nepali Dictionary (1 entries)\""));
+        assert!(response.contains("250 Command complete"));
     }
 }
